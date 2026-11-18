@@ -48,7 +48,8 @@ Secret keys are the setting names without the prefix, in kebab-case, for example
 | Setting | Notes |
 |---|---|
 | `ADF_SUBSCRIPTION_ID`, `ADF_RESOURCE_GROUP`, `ADF_FACTORY_NAME` | all three, or none to skip ADF |
-| `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET` | service principal for ADF; **needed on Databricks**. Locally `az login` is enough |
+| `AZURE_SERVICE_CREDENTIAL` | name of a Unity Catalog service credential for ADF. **Recommended on Databricks**: no secret. Takes precedence over the service principal |
+| `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET` | service principal for ADF (all three or none). Locally, `az login` is enough |
 | `DATABRICKS_HOST`, `DATABRICKS_TOKEN` | not needed inside Databricks; elsewhere the token is optional (Azure CLI auth also works) |
 | `ENABLE_DATABRICKS` | force on/off; default is on when a host is set or running on Databricks |
 | `TEAMS_WEBHOOK_URL` | Teams **Workflows** webhook (Adaptive Card) |
@@ -56,9 +57,102 @@ Secret keys are the setting names without the prefix, in kebab-case, for example
 | `LOOKBACK_HOURS` (24), `ADF_STUCK_MINUTES` (120), `CLUSTER_STUCK_MINUTES` (20) | thresholds |
 | `REMEDIATION_*` | see above |
 
-**Permissions:** the service principal needs *Data Factory Contributor* or a reader role that
-includes `pipelineruns/queryByFactory` on the factory. The Databricks identity needs to list
-clusters and job runs, plus *Can Restart* on clusters that opt in to remediation.
+**Permissions:** the ADF identity needs the *ADF Run Monitor* role described below. The built-in
+*Reader* role is **not** enough, because querying runs is an action, not a read. The Databricks
+identity needs to list clusters and job runs, plus *Can Restart* on clusters that opt in to
+remediation.
+
+## Giving Databricks access to ADF
+
+The agent picks the Azure login in this order: **service credential**, then **service
+principal**, then `DefaultAzureCredential` (`az login` locally). Whichever identity it uses
+needs the role below.
+
+### Step 1: a least-privilege role (both options)
+
+Save as `adf-run-monitor.json`:
+
+```json
+{
+  "Name": "ADF Run Monitor",
+  "Description": "Read factory and query pipeline runs",
+  "Actions": [
+    "Microsoft.DataFactory/factories/read",
+    "Microsoft.DataFactory/factories/pipelineruns/read",
+    "Microsoft.DataFactory/factories/querypipelineruns/action"
+  ],
+  "AssignableScopes": ["/subscriptions/<subscription-id>"]
+}
+```
+
+```bash
+az role definition create --role-definition @adf-run-monitor.json
+```
+
+Creating a custom role needs Owner or User Access Administrator on the subscription. As a
+fallback, assign the built-in *Data Factory Contributor* role, scoped to the one factory only.
+It works, but it can also edit and run pipelines.
+
+Below, `FACTORY_ID` stands for
+`/subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.DataFactory/factories/<name>`.
+
+### Option A (recommended): Unity Catalog service credential, no secret
+
+Requires a Unity Catalog workspace and compute that supports service credentials (serverless
+or a recent runtime; check the Databricks docs for your access mode).
+
+1. Create an **Access Connector for Azure Databricks** (Azure portal), with a system-assigned
+   managed identity.
+2. Give that managed identity the role on the factory:
+   ```bash
+   az role assignment create --assignee-object-id <connector-principal-id> \
+     --assignee-principal-type ServicePrincipal \
+     --role "ADF Run Monitor" --scope "$FACTORY_ID"
+   ```
+3. In Databricks: **Catalog → External data → Credentials → Create credential**, type
+   **Service credential**, then paste the access connector's resource ID. Name it, for
+   example, `adf-monitor`.
+4. Let the job's run-as identity use it:
+   ```sql
+   GRANT ACCESS ON SERVICE CREDENTIAL `adf-monitor` TO `<user-or-service-principal>`;
+   ```
+5. Store the name in the scope:
+   `databricks secrets put-secret health-agent azure-service-credential` (value: `adf-monitor`).
+
+### Option B: service principal with a client secret
+
+```bash
+az ad sp create-for-rbac --name sp-platform-health-agent --years 1   # note appId, password, tenant
+az role assignment create --assignee <appId> --role "ADF Run Monitor" --scope "$FACTORY_ID"
+databricks secrets put-secret health-agent azure-tenant-id
+databricks secrets put-secret health-agent azure-client-id
+databricks secrets put-secret health-agent azure-client-secret
+```
+
+The secret expires (1 year above), so plan to rotate it. A Key Vault-backed secret scope makes
+rotating it a single update.
+
+### Both options: secret-scope access and a smoke test
+
+```bash
+databricks secrets put-acl health-agent <job-run-as-principal> READ
+```
+
+```python
+from datetime import UTC, datetime
+from health_agent import Settings
+from health_agent.collectors.adf import ADFCollector
+
+s = Settings.from_databricks_secrets(dbutils, scope="health-agent")
+print(ADFCollector.from_settings(s).collect(datetime.now(UTC)).metrics)
+```
+
+| Error | Likely cause |
+|---|---|
+| `AuthorizationFailed` | role not assigned on the factory, or not yet in effect (allow a few minutes) |
+| `AADSTS…` | wrong tenant, client id or secret, or the secret has expired |
+| `PERMISSION_DENIED` on the credential | missing `GRANT ACCESS ON SERVICE CREDENTIAL` |
+| timeout | workspace egress blocks `login.microsoftonline.com` / `management.azure.com` |
 
 ### Teams webhook
 

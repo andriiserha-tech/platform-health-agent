@@ -32,6 +32,9 @@ class Settings(BaseSettings):
     azure_tenant_id: str | None = None
     azure_client_id: str | None = None
     azure_client_secret: SecretStr | None = None
+    # Preferred on Databricks: name of a Unity Catalog *service credential* (managed identity via
+    # an Access Connector). Takes precedence over the service principal; no secret to rotate.
+    azure_service_credential: str | None = None
 
     # Databricks. Inside a notebook/job both can be empty: the SDK uses the runtime's own auth.
     # Elsewhere the token is optional too; the SDK falls back to Azure CLI / managed identity.
@@ -74,6 +77,12 @@ class Settings(BaseSettings):
             raise ValueError(
                 "ADF config is partial: set all of ADF_SUBSCRIPTION_ID, "
                 "ADF_RESOURCE_GROUP and ADF_FACTORY_NAME, or none of them"
+            )
+        sp = [self.azure_tenant_id, self.azure_client_id, self.azure_client_secret]
+        if any(sp) and not all(sp):
+            raise ValueError(
+                "Service principal config is partial: set all of AZURE_TENANT_ID, "
+                "AZURE_CLIENT_ID and AZURE_CLIENT_SECRET, or none of them"
             )
         return self
 

@@ -15,16 +15,30 @@ logger = logging.getLogger(__name__)
 
 
 def azure_credential(settings: Settings) -> Any:
-    """Service principal when configured (needed on Databricks clusters), else the default chain
-    (az login locally, managed identity in Azure)."""
+    """Pick the Azure login for ADF, in order of preference:
+
+    1. Unity Catalog service credential (on Databricks): a managed identity, no secret to rotate.
+    2. Service principal (tenant id + client id + secret).
+    3. DefaultAzureCredential: az login locally, managed identity on Azure compute.
+    """
+    if settings.azure_service_credential:
+        from health_agent.databricks_utils import get_dbutils
+
+        logger.info("ADF auth: service credential %r", settings.azure_service_credential)
+        return get_dbutils().credentials.getServiceCredentialsProvider(
+            settings.azure_service_credential
+        )
+
     from azure.identity import ClientSecretCredential, DefaultAzureCredential
 
     if settings.azure_client_id and settings.azure_client_secret and settings.azure_tenant_id:
+        logger.info("ADF auth: service principal %s", settings.azure_client_id)
         return ClientSecretCredential(
             tenant_id=settings.azure_tenant_id,
             client_id=settings.azure_client_id,
             client_secret=settings.azure_client_secret.get_secret_value(),
         )
+    logger.info("ADF auth: DefaultAzureCredential")
     return DefaultAzureCredential()
 
 
