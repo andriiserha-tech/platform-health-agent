@@ -1,0 +1,53 @@
+# Databricks Asset Bundle: builds the wheel, uploads it, and deploys a scheduled job.
+#   databricks bundle validate
+#   databricks bundle deploy -t dev
+#   databricks bundle run platform_health_check -t dev
+bundle:
+  name: platform-health-agent
+
+variables:
+  secret_scope:
+    description: Secret scope holding the agent's settings (see README)
+    default: health-agent
+
+artifacts:
+  default:
+    type: whl
+    build: python3 -m build --wheel
+    path: .
+
+resources:
+  jobs:
+    platform_health_check:
+      name: platform-health-check
+      schedule:
+        quartz_cron_expression: "0 0 * * * ?"  # hourly
+        timezone_id: UTC
+        pause_status: PAUSED  # unpause once you've checked a manual run
+      max_concurrent_runs: 1
+      tasks:
+        - task_key: health_check
+          environment_key: default
+          python_wheel_task:
+            package_name: platform_health_agent
+            entry_point: health-agent
+            # Add "--remediate" only after reviewing the dry-run output in a few runs.
+            parameters: ["--secret-scope", "${var.secret_scope}", "--fail-on", "critical"]
+      environments:
+        - environment_key: default
+          spec:
+            client: "1"
+            dependencies:
+              - ./dist/*.whl
+
+targets:
+  dev:
+    mode: development
+    default: true
+    # workspace:
+    #   host: https://adb-<workspace-id>.<n>.azuredatabricks.net
+  prod:
+    mode: production
+    # workspace:
+    #   host: https://adb-<workspace-id>.<n>.azuredatabricks.net
+    #   root_path: /Workspace/Shared/.bundle/${bundle.name}/${bundle.target}
